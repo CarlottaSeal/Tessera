@@ -1,0 +1,12 @@
+﻿<StaticModelInfo
+    objFile = "Data/Models/LewisSet/King_black.glb"
+    shader = "Data/Shaders/BlinnPhong"
+    diffuseMap = ""
+    normalMap = ""
+    specGlossEmitMap = ""
+    unitsPerMeter = "0.064"
+flipUV = "true"
+    x = "left"
+    y="up"
+    z="forward"
+/>

@@ -1,0 +1,41 @@
+# Build artifacts
+Temporary/
+*.obj
+*.pdb
+*.idb
+*.ilk
+*.iobj
+*.ipdb
+*.exp
+*.lib
+*.tlog
+*.log
+*.recipe
+
+# VS / Rider local state
+.vs/
+.idea/
+*.user
+*.suo
+*.opensdf
+*.sdf
+*.VC.db
+*.VC.opendb
+
+# Built executables (rebuild from source)
+Run/*.exe
+Run/*.pdb
+Run/*.ilk
+
+# Generated logs
+Run/Logs/
+
+# Crash dumps
+*.dmp
+
+# Stale game instructions (replaced by README.md)
+ReadMe.txt
+DEFERRED_DEMO.md
+
+# Stale template solution (use VulkanTest.sln)
+Protogame3D.sln
