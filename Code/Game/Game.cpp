@@ -23,6 +23,9 @@
 #include "Engine/Renderer/Camera.hpp"
 #include "Engine/Renderer/IndexBuffer.hpp"
 #include "Engine/Renderer/VertexBuffer.hpp"
+
+#include <future>
+#include <vector>
 #include "Engine/Renderer/VulkanRenderer.h"
 #include "Engine/Renderer/VulkanDeferredPath.h"
 #include "Engine/Audio/AudioSystem.hpp"
@@ -150,6 +153,11 @@ void Game::Update()
 	{
 		m_useForwardPath = !m_useForwardPath;
 	}
+	if (g_theApp->WasKeyJustPressed(KEYCODE_F3))
+	{
+		m_useMultithreading = !m_useMultithreading;
+		g_theDeferred->SetMultithreadingEnabled(m_useMultithreading);
+	}
 
 	if (g_theDevConsole->GetMode() == OPEN_FULL)
 	{
@@ -232,31 +240,86 @@ void Game::Render() const
 		g_theRenderer->SetModelConstants();
 		g_theRenderer->DrawVertexArray(m_gridVertexes);
 
-		auto drawPiece = [](StaticMesh* mesh, Vec3 const& pos, float yawDeg, Rgba8 tint)
-		{
-			if (!mesh || !mesh->m_vertexBuffer || !mesh->m_indexBuffer) return;
-			Mat44 model;
-			model.AppendZRotation(yawDeg);
-			model.SetTranslation3D(pos);
-			model.Append(mesh->m_transform);
-			g_theRenderer->SetMaterialConstants(mesh->m_diffuseTexture, mesh->m_normalTexture, mesh->m_specularTexture);
-			g_theRenderer->SetModelConstants(model, tint);
-			g_theRenderer->DrawIndexBuffer(mesh->m_vertexBuffer, mesh->m_indexBuffer,
-				(unsigned int)mesh->m_indices.size());
-		};
 		const float row = 5.f;
 		const float dy = 1.1f;
-		drawPiece(m_chessRook,   Vec3(row, -3.f * dy, 0.f), 0.f, Rgba8::WHITE);
-		drawPiece(m_chessKnight, Vec3(row, -2.f * dy, 0.f), 0.f, Rgba8::WHITE);
-		drawPiece(m_chessBishop, Vec3(row, -1.f * dy, 0.f), 0.f, Rgba8::WHITE);
-		drawPiece(m_chessQueen,  Vec3(row,  0.f * dy, 0.f), 0.f, Rgba8::WHITE);
-		drawPiece(m_chessKing,   Vec3(row,  1.f * dy, 0.f), 0.f, Rgba8::WHITE);
-		drawPiece(m_chessBishop, Vec3(row,  2.f * dy, 0.f), 0.f, Rgba8::WHITE);
-		drawPiece(m_chessKnight, Vec3(row,  3.f * dy, 0.f), 0.f, Rgba8::WHITE);
-		drawPiece(m_chessRook,   Vec3(row,  4.f * dy, 0.f), 0.f, Rgba8::WHITE);
-		for (int i = 0; i < 8; ++i)
+		struct PieceSpec { StaticMesh* mesh; Vec3 pos; };
+		PieceSpec pieces[16] = {
+			{m_chessRook,   Vec3(row, -3.f * dy, 0.f)},
+			{m_chessKnight, Vec3(row, -2.f * dy, 0.f)},
+			{m_chessBishop, Vec3(row, -1.f * dy, 0.f)},
+			{m_chessQueen,  Vec3(row,  0.f * dy, 0.f)},
+			{m_chessKing,   Vec3(row,  1.f * dy, 0.f)},
+			{m_chessBishop, Vec3(row,  2.f * dy, 0.f)},
+			{m_chessKnight, Vec3(row,  3.f * dy, 0.f)},
+			{m_chessRook,   Vec3(row,  4.f * dy, 0.f)},
+			{m_chessPawn,   Vec3(row - 1.2f, -3.5f * dy, 0.f)},
+			{m_chessPawn,   Vec3(row - 1.2f, -2.5f * dy, 0.f)},
+			{m_chessPawn,   Vec3(row - 1.2f, -1.5f * dy, 0.f)},
+			{m_chessPawn,   Vec3(row - 1.2f, -0.5f * dy, 0.f)},
+			{m_chessPawn,   Vec3(row - 1.2f,  0.5f * dy, 0.f)},
+			{m_chessPawn,   Vec3(row - 1.2f,  1.5f * dy, 0.f)},
+			{m_chessPawn,   Vec3(row - 1.2f,  2.5f * dy, 0.f)},
+			{m_chessPawn,   Vec3(row - 1.2f,  3.5f * dy, 0.f)},
+		};
+
+		std::future<void> workerA, workerB;
+		if (m_useMultithreading)
 		{
-			drawPiece(m_chessPawn, Vec3(row - 1.2f, ((float)i - 3.5f) * dy, 0.f), 0.f, Rgba8::WHITE);
+			// Pre-stage on main: capture per-piece state into PreparedDraws. SetModelConstants
+			// advances the model UBO ring; SetMaterialConstants writes the bindless slot trio.
+			static std::vector<VulkanDeferredPath::PreparedDraw> prepared;
+			prepared.clear();
+			prepared.reserve(16);
+			VkPipeline pcuTbnPipe = g_theDeferred->GetGBufferPCUTBNPipeline();
+			for (auto const& p : pieces)
+			{
+				if (!p.mesh || !p.mesh->m_vertexBuffer || !p.mesh->m_indexBuffer) continue;
+				Mat44 model;
+				model.SetTranslation3D(p.pos);
+				model.Append(p.mesh->m_transform);
+				g_theRenderer->SetMaterialConstants(p.mesh->m_diffuseTexture, p.mesh->m_normalTexture, p.mesh->m_specularTexture);
+				g_theRenderer->SetModelConstants(model, Rgba8::WHITE);
+
+				VulkanDeferredPath::PreparedDraw d;
+				d.pipeline            = pcuTbnPipe;
+				d.vbo                 = p.mesh->m_vertexBuffer->GetVkBuffer();
+				d.ibo                 = p.mesh->m_indexBuffer->GetVkBuffer();
+				d.indexCount          = (unsigned int)p.mesh->m_indices.size();
+				d.cameraDynamicOffset = vk->GetCurrentCameraDynamicOffset();
+				d.modelDynamicOffset  = vk->GetCurrentModelDynamicOffset();
+				d.material            = vk->GetCurrentMaterial();
+				prepared.push_back(d);
+			}
+
+			// Kick workers (don't wait yet — main continues with debug-render in parallel).
+			const int half = (int)prepared.size() / 2;
+			workerA = std::async(std::launch::async, [&]() {
+				VkCommandBuffer sec = g_theDeferred->BeginThreadSecondary(1, swapIdx);
+				g_theDeferred->RecordPreparedDraws(sec, prepared.data(), half);
+				g_theDeferred->EndThreadSecondary(1);
+			});
+			workerB = std::async(std::launch::async, [&]() {
+				VkCommandBuffer sec = g_theDeferred->BeginThreadSecondary(2, swapIdx);
+				g_theDeferred->RecordPreparedDraws(sec, prepared.data() + half, (int)prepared.size() - half);
+				g_theDeferred->EndThreadSecondary(2);
+			});
+		}
+		else
+		{
+			auto drawPiece = [](StaticMesh* mesh, Vec3 const& pos, float yawDeg, Rgba8 tint)
+			{
+				if (!mesh || !mesh->m_vertexBuffer || !mesh->m_indexBuffer) return;
+				Mat44 model;
+				model.AppendZRotation(yawDeg);
+				model.SetTranslation3D(pos);
+				model.Append(mesh->m_transform);
+				g_theRenderer->SetMaterialConstants(mesh->m_diffuseTexture, mesh->m_normalTexture, mesh->m_specularTexture);
+				g_theRenderer->SetModelConstants(model, tint);
+				g_theRenderer->DrawIndexBuffer(mesh->m_vertexBuffer, mesh->m_indexBuffer,
+					(unsigned int)mesh->m_indices.size());
+			};
+			for (auto const& p : pieces)
+				drawPiece(p.mesh, p.pos, 0.f, Rgba8::WHITE);
 		}
 
 		for (int i = 0; i < lightsAB.numLights; ++i)
@@ -271,13 +334,20 @@ void Game::Render() const
 		}
 		DebugRenderWorld(((Player*)m_player)->m_worldCamera);
 
+		// If MT was kicked, wait for both workers before EndGBufferAndRunLighting collects
+		// secondaries for vkCmdExecuteCommands.
+		if (workerA.valid()) workerA.wait();
+		if (workerB.valid()) workerB.wait();
+
 		if (m_useForwardPath)
 			g_theDeferred->EndForwardLit(cmd);
 		else
 			g_theDeferred->EndGBufferAndRunLighting(cmd, lightsAB);
 
 		char modeBuf[64];
-		snprintf(modeBuf, sizeof(modeBuf), " mode: %s   F2 to toggle", m_useForwardPath ? "FORWARD" : "DEFERRED");
+		snprintf(modeBuf, sizeof(modeBuf), " mode: %s [F2]   MT: %s [F3]",
+			m_useForwardPath ? "FORWARD" : "DEFERRED",
+			m_useMultithreading ? "ON" : "OFF");
 		DebugAddScreenText(modeBuf, m_screenCamera.GetOrthographicTopRight() - Vec2(360.f, 50.f), 12.f, Vec2::ZERO, 0.f);
 
 		double gbufMs = 0.0, lightMs = 0.0, fwdMs = 0.0;

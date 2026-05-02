@@ -174,115 +174,85 @@ GPU-complete, so the read is non-blocking and never trips the validation layer's
 "query not reset" check. The cached values are exposed via `TryGetLastFrameTimings`
 (deferred) and `TryGetLastForwardMs` (forward) and shown in the HUD.
 
-## What's *not* in this demo (and what it would take)
+## Multi-threaded subpass-0 recording
 
-The demo is a single-threaded, single-secondary-command-buffer renderer. Two
-common pieces of "polished" Vulkan work were considered and explicitly scoped out;
-this section documents the design so the gap is honest.
+Vulkan's flagship architectural advantage — recording command buffers in
+parallel and merging via `vkCmdExecuteCommands` — is wired up here. F3 toggles
+it on/off at runtime; the HUD shows `MT: ON / OFF` next to the deferred/forward
+mode label, so frame timings can be A/B compared in the same session.
 
-### 1. Multi-threaded command-buffer recording
-
-Vulkan's flagship architectural advantage is that command buffers can be recorded
-in parallel from multiple threads, then merged into a primary via
-`vkCmdExecuteCommands`. This demo doesn't do that — all 16 chess pieces and the
-inline scene draws are recorded onto a single primary on the main thread.
-
-The pattern, if implemented, would be:
+**Layout: 1 main thread + 2 worker threads, 3 secondaries per frame slot.**
 
 ```
-per-thread:                       per frame:
-  VkCommandPool poolPerSlot[2]      reset thisFrame's pool on each thread
-  VkCommandBuffer secondary[2]      vkAllocateCommandBuffers from it
-                                    vkBeginCommandBuffer(secondary, inheritanceInfo
-                                      pointing at deferredRenderPass + subpass 0
-                                      + framebuffer)
-                                    record draws into secondary
+deferred subpass 0 contents = SECONDARY_COMMAND_BUFFERS  (when MT on)
 
-main thread:
-  vkCmdBeginRenderPass(primary, …, VK_SUBPASS_CONTENTS_SECONDARY_COMMAND_BUFFERS)
-  std::async on N workers (each takes its piece slice + its secondary)
-  wait
-  vkCmdExecuteCommands(primary, N, secondaries)
-  vkCmdNextSubpass(primary, VK_SUBPASS_CONTENTS_INLINE)
-  // lighting subpass stays inline — single full-screen draw, no parallelism payoff
+main thread (secondary[0]):                    worker 1 (secondary[1]):       worker 2 (secondary[2]):
+  cubes / sphere / grid via engine API           pieces 0..7 via raw vkCmd*     pieces 8..15 via raw vkCmd*
+  light gizmos via DebugRenderWorld              (PreparedDraw replay)          (PreparedDraw replay)
+  (recorded INTO secondary[0], not primary,
+   via SetActiveRecordingTarget redirect)
+
+main thread joins workers, then
+  vkCmdExecuteCommands(primary, 3, secondaries)
+  vkCmdNextSubpass(primary, INLINE) for lighting
   vkCmdEndRenderPass(primary)
 ```
 
-The blocker isn't the pattern itself; it's that the engine's `DrawIndexBuffer`
-folds three thread-unsafe operations into the per-draw critical path:
-
-1. **Model UBO ring write.** Each draw appends a `ModelConstants` struct to a
-   shared, host-mapped ring buffer and captures the dynamic offset. With workers
-   recording in parallel, two threads racing on the ring's tail offset would
-   produce overlapping writes.
-2. **Bindless texture registration.** First-time-seen textures are added to the
-   256-slot atlas, which writes a descriptor set. `vkUpdateDescriptorSets` is not
-   thread-safe with respect to other writers of the same set.
-3. **Texture-binding-dirty descriptor update path.** Legacy code path that calls
-   `vkUpdateDescriptorSets` mid-draw — same threading issue as above.
-
-The clean fix, before adding workers, is to split `DrawIndexBuffer` into two
-phases: a main-thread "prepare" phase that performs the model UBO write, dynamic
-offset capture, and bindless registration, returning a small per-draw struct, and
-a thread-safe "record" phase that takes the struct and emits Vulkan commands.
-Workers would then own only the record phase. Roughly:
+**Prepare-then-record split.** The engine's `DrawIndexBuffer` mixes three
+thread-unsafe operations into the per-draw critical path: model UBO ring
+writes (host-mapped, shared offset), bindless texture registration
+(`vkUpdateDescriptorSets` on a shared set), and dynamic descriptor binds. So
+workers can't call the engine API directly. Instead, main captures all per-piece
+state into a `PreparedDraw` struct ahead of the worker kick:
 
 ```cpp
 struct PreparedDraw {
-    VkBuffer vbo, ibo;
-    uint32_t indexCount;
-    uint32_t modelDynamicOffset;   // captured on main
-    uint32_t cameraDynamicOffset;  // captured on main
-    uint32_t bindlessDiffuseId;    // captured on main
-    VkPipeline pipeline;
+    VkPipeline    pipeline;
+    VkBuffer      vbo, ibo;
+    uint32_t      indexCount;
+    uint32_t      cameraDynamicOffset;   // captured from VulkanRenderer state
+    uint32_t      modelDynamicOffset;
+    VkMaterialPC  material;              // 16-byte push constant snapshot
 };
-
-// main thread, per piece:
-PreparedDraw d = renderer->PrepareDraw(piece);
-worker[i].queue.push_back(d);
-
-// worker thread:
-for (PreparedDraw const& d : queue) {
-    vkCmdBindPipeline(secondary, …, d.pipeline);
-    vkCmdBindDescriptorSets(secondary, …, dynOffsets={d.cameraDynamicOffset, d.modelDynamicOffset});
-    vkCmdPushConstants(secondary, …, &d.bindlessDiffuseId);
-    vkCmdBindVertexBuffers(secondary, 0, 1, &d.vbo, &zero);
-    vkCmdBindIndexBuffer(secondary, d.ibo, 0, …);
-    vkCmdDrawIndexed(secondary, d.indexCount, 1, 0, 0, 0);
-}
 ```
 
-That's a refactor on the order of a day; the demo deferred it to keep the
-single-threaded path stable. The infrastructure that *would* be needed
-(secondary cmd buffer pattern, `VK_SUBPASS_CONTENTS_SECONDARY_COMMAND_BUFFERS`,
-inheritance info plumbing, per-thread cmd pools tracked per in-flight frame
-slot) is straightforward; the engine refactor is what makes it real work.
+Workers then issue raw `vkCmd*` calls into their own secondary cmd buffers —
+no engine API touched, no shared writable state read.
 
-### 2. Normal mapping
+**Per-thread command pools, double-buffered.** Each thread owns
+`VkCommandPool[MAX_FRAMES_IN_FLIGHT]`; only the slot whose previous use has
+GPU-completed (guaranteed by the engine's frame-start fence wait) is reset and
+reallocated. Pool reset is per-thread — no cross-thread sync — and Vulkan's
+"command pool is externally synchronised" rule is satisfied because each pool
+is only ever touched by one thread.
 
-PCUTBN tangent / bitangent attributes are plumbed end-to-end (vertex buffer →
-vertex shader → fragment shader inputs would just need adding), and each chess
-piece's normal map is auto-extracted from its GLB at load time
-(`Models/LewisSet/<piece>_normal.png` is generated by `StaticMesh`). What the
-demo doesn't do is sample those normal maps — `gbuffer_pcutbn.frag` writes the
-interpolated vertex normal directly. Adding tangent-space normal mapping would
-be:
+**Parallelism overlap.** The kick is non-blocking: main fires the two workers
+via `std::async` and immediately continues recording its own debug-render
+geometry into `secondary[0]`. Only then does it `wait()` on the workers, so
+main and workers genuinely overlap.
 
-1. Register each piece's normal texture into the bindless atlas (same path as
-   diffuse). With `RegisterTextureBindless` calls colocated, diffuse and normal
-   end up in adjacent slots `D` and `D+1`.
-2. Either widen the per-draw push constant from 4 bytes to 8 (carry both
-   `diffuseId` and `normalId`) — which means widening every pipeline layout in
-   the project — or rely on the `D+1` convention and have the shader sample
-   `g_textures[diffuseId + 1]` for the normal map.
-3. In `gbuffer_pcutbn.frag`, sample the normal map, decode `[0,1] → [-1,1]`,
-   construct `mat3 TBN = mat3(T_world, B_world, N_world)`, transform the sampled
-   normal into world space, write to `gNormal.rgb`.
+**Honest measurement note.** For this 16-piece scene with ~30 draws total, the
+recording cost is microseconds per frame even single-threaded — far below
+GPU-bound frame time, so multithreading doesn't move the FPS counter on
+desktop. The architectural value shows up in shipped engines that record
+hundreds of thousands of draws per frame, where main-thread cmd recording is
+genuinely a bottleneck. The demo proves the pattern; it doesn't prove the
+benefit at this scale.
 
-Realistic effort: an afternoon, and visually the piece geometry would gain the
-sub-millimetre relief that the LewisSet textures encode. Skipped for the same
-reason: the existing demo is stable, and the value-per-hour was higher elsewhere
-in the design space.
+### Normal mapping
+
+PCUTBN tangent / bitangent attributes are plumbed through `gbuffer_pcutbn.vert`,
+and each chess piece's normal map is auto-extracted from its GLB at load time
+(`Models/LewisSet/<piece>_normal.png` generated by `StaticMesh`). The
+PCUTBN-only fragment shaders (`gbuffer_pcutbn.frag` for deferred,
+`forward_lit_pcutbn.frag` for forward A/B) sample the normal map at
+`mat.NormalId`, decode `[0,1] → [-1,1]`, construct `mat3(T, B, N)` from the
+interpolated tangent / bitangent / normal, and transform the tangent-space
+normal to world space before writing to `gNormal.rgb`. Diffuse / normal /
+specular bindless slot ids ride together in a 16-byte `MaterialConstants` push
+constant — same layout DX12's `MaterialConstants` CB uses, so `BindTexture(t,
+slot)` and `SetMaterialConstants(d, n, s)` work identically across the two
+backends.
 
 ## Build
 
@@ -318,6 +288,7 @@ Run/Data/Shaders/Vulkan/deferred/forward_lit.frag.spv
 - `Shift` — speed boost
 - `H` — recenter camera
 - `F2` — toggle deferred ↔ forward render path (HUD shows current mode + GPU ms)
+- `F3` — toggle multithreaded subpass-0 recording on/off
 - `~` (tilde) — toggle dev console
 - `Esc` — back to attract mode, then quit
 

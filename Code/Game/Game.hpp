@@ -53,7 +53,8 @@ private:
 	void DebugAddWorldAxisText(Mat44 worldMat);
 
 private:
-	bool m_useForwardPath = false; // F2 toggles between deferred (default) and forward A/B paths
+	bool m_useForwardPath    = false; // F2 toggles between deferred (default) and forward A/B paths
+	bool m_useMultithreading = false; // F3 toggles secondary-cmd-buffer recording on subpass 0
 	bool m_isSlowMo;
 	bool m_isUsingUserTimeScale;
 
