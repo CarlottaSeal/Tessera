@@ -27,6 +27,15 @@ Run/*.exe
 Run/*.pdb
 Run/*.ilk
 
+# Third-party DLLs (license; users download FMOD separately)
+Run/*.dll
+
+# ImGui runtime window-state cache
+Run/imgui.ini
+
+# VS resource-editor binary cache (auto-regenerated from .rc)
+*.aps
+
 # Generated logs
 Run/Logs/
 
