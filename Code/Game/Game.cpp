@@ -26,6 +26,7 @@
 
 #include <future>
 #include <vector>
+#include <cmath>
 #include "Engine/Renderer/VulkanRenderer.h"
 #include "Engine/Renderer/VulkanDeferredPath.h"
 #include "Engine/Audio/AudioSystem.hpp"
@@ -158,6 +159,16 @@ void Game::Update()
 		m_useMultithreading = !m_useMultithreading;
 		g_theDeferred->SetMultithreadingEnabled(m_useMultithreading);
 	}
+	if (g_theApp->WasKeyJustPressed(KEYCODE_F4))
+	{
+		switch (m_pieceCount)
+		{
+			case 16:   m_pieceCount = 256;  break;
+			case 256:  m_pieceCount = 1024; break;
+			case 1024: m_pieceCount = 4096; break;
+			default:   m_pieceCount = 16;   break;
+		}
+	}
 
 	if (g_theDevConsole->GetMode() == OPEN_FULL)
 	{
@@ -243,24 +254,46 @@ void Game::Render() const
 		const float row = 5.f;
 		const float dy = 1.1f;
 		struct PieceSpec { StaticMesh* mesh; Vec3 pos; };
-		PieceSpec pieces[16] = {
-			{m_chessRook,   Vec3(row, -3.f * dy, 0.f)},
-			{m_chessKnight, Vec3(row, -2.f * dy, 0.f)},
-			{m_chessBishop, Vec3(row, -1.f * dy, 0.f)},
-			{m_chessQueen,  Vec3(row,  0.f * dy, 0.f)},
-			{m_chessKing,   Vec3(row,  1.f * dy, 0.f)},
-			{m_chessBishop, Vec3(row,  2.f * dy, 0.f)},
-			{m_chessKnight, Vec3(row,  3.f * dy, 0.f)},
-			{m_chessRook,   Vec3(row,  4.f * dy, 0.f)},
-			{m_chessPawn,   Vec3(row - 1.2f, -3.5f * dy, 0.f)},
-			{m_chessPawn,   Vec3(row - 1.2f, -2.5f * dy, 0.f)},
-			{m_chessPawn,   Vec3(row - 1.2f, -1.5f * dy, 0.f)},
-			{m_chessPawn,   Vec3(row - 1.2f, -0.5f * dy, 0.f)},
-			{m_chessPawn,   Vec3(row - 1.2f,  0.5f * dy, 0.f)},
-			{m_chessPawn,   Vec3(row - 1.2f,  1.5f * dy, 0.f)},
-			{m_chessPawn,   Vec3(row - 1.2f,  2.5f * dy, 0.f)},
-			{m_chessPawn,   Vec3(row - 1.2f,  3.5f * dy, 0.f)},
-		};
+		std::vector<PieceSpec> pieces;
+		if (m_pieceCount <= 16)
+		{
+			pieces = {
+				{m_chessRook,   Vec3(row, -3.f * dy, 0.f)},
+				{m_chessKnight, Vec3(row, -2.f * dy, 0.f)},
+				{m_chessBishop, Vec3(row, -1.f * dy, 0.f)},
+				{m_chessQueen,  Vec3(row,  0.f * dy, 0.f)},
+				{m_chessKing,   Vec3(row,  1.f * dy, 0.f)},
+				{m_chessBishop, Vec3(row,  2.f * dy, 0.f)},
+				{m_chessKnight, Vec3(row,  3.f * dy, 0.f)},
+				{m_chessRook,   Vec3(row,  4.f * dy, 0.f)},
+				{m_chessPawn,   Vec3(row - 1.2f, -3.5f * dy, 0.f)},
+				{m_chessPawn,   Vec3(row - 1.2f, -2.5f * dy, 0.f)},
+				{m_chessPawn,   Vec3(row - 1.2f, -1.5f * dy, 0.f)},
+				{m_chessPawn,   Vec3(row - 1.2f, -0.5f * dy, 0.f)},
+				{m_chessPawn,   Vec3(row - 1.2f,  0.5f * dy, 0.f)},
+				{m_chessPawn,   Vec3(row - 1.2f,  1.5f * dy, 0.f)},
+				{m_chessPawn,   Vec3(row - 1.2f,  2.5f * dy, 0.f)},
+				{m_chessPawn,   Vec3(row - 1.2f,  3.5f * dy, 0.f)},
+			};
+		}
+		else
+		{
+			StaticMesh* meshes[6] = { m_chessKing, m_chessQueen, m_chessRook,
+			                          m_chessBishop, m_chessKnight, m_chessPawn };
+			const int side = (int)std::sqrt((float)m_pieceCount);
+			pieces.reserve((size_t)side * side);
+			const float halfExtent = side * 0.55f;
+			for (int i = 0; i < side; ++i)
+			{
+				for (int j = 0; j < side; ++j)
+				{
+					Vec3 p(row + (float)i * 1.2f - halfExtent,
+					       (float)j * dy - halfExtent,
+					       0.f);
+					pieces.push_back({ meshes[(i + j) % 6], p });
+				}
+			}
+		}
 
 		std::future<void> workerA, workerB;
 		if (m_useMultithreading)
@@ -269,7 +302,7 @@ void Game::Render() const
 			// advances the model UBO ring; SetMaterialConstants writes the bindless slot trio.
 			static std::vector<VulkanDeferredPath::PreparedDraw> prepared;
 			prepared.clear();
-			prepared.reserve(16);
+			prepared.reserve(pieces.size());
 			VkPipeline pcuTbnPipe = g_theDeferred->GetGBufferPCUTBNPipeline();
 			for (auto const& p : pieces)
 			{
@@ -344,11 +377,18 @@ void Game::Render() const
 		else
 			g_theDeferred->EndGBufferAndRunLighting(cmd, lightsAB);
 
-		char modeBuf[64];
-		snprintf(modeBuf, sizeof(modeBuf), " mode: %s [F2]   MT: %s [F3]",
-			m_useForwardPath ? "FORWARD" : "DEFERRED",
-			m_useMultithreading ? "ON" : "OFF");
-		DebugAddScreenText(modeBuf, m_screenCamera.GetOrthographicTopRight() - Vec2(360.f, 50.f), 12.f, Vec2::ZERO, 0.f);
+		char modeBuf[128];
+		if (m_useForwardPath)
+		{
+			snprintf(modeBuf, sizeof(modeBuf), " mode: FORWARD [F2]   MT: %s [F3]   pieces: %d [F4]",
+				m_useMultithreading ? "ON" : "OFF", m_pieceCount);
+		}
+		else
+		{
+			snprintf(modeBuf, sizeof(modeBuf), " mode: DEFERRED [F2]   MT: %s [F3]   pieces: %d [F4]   cpu rec: %.2f ms",
+				m_useMultithreading ? "ON" : "OFF", m_pieceCount, g_theDeferred->GetCpuRecAvgMs());
+		}
+		DebugAddScreenText(modeBuf, m_screenCamera.GetOrthographicTopRight() - Vec2(580.f, 50.f), 12.f, Vec2::ZERO, 0.f);
 
 		double gbufMs = 0.0, lightMs = 0.0, fwdMs = 0.0;
 		if (g_theDeferred->TryGetLastFrameTimings(gbufMs, lightMs))

@@ -55,6 +55,7 @@ private:
 private:
 	bool m_useForwardPath    = false; // F2 toggles between deferred (default) and forward A/B paths
 	bool m_useMultithreading = false; // F3 toggles secondary-cmd-buffer recording on subpass 0
+	int  m_pieceCount        = 16;    // F4 cycles {16, 256, 1024, 4096} for MT scaling tests
 	bool m_isSlowMo;
 	bool m_isUsingUserTimeScale;
 
