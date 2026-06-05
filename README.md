@@ -7,6 +7,35 @@ side by side so the bandwidth payoff can be measured directly.
 
 ![scene](Run/Data/Images/Show.png)
 
+## Where the code lives
+
+This repository is the **demo app** — game-side code, shaders, docs, and the
+`Run/` folder. The actual Vulkan rendering implementation is in a separate
+multi-API C++ engine that backs DX12, DX11, and Vulkan from a shared
+abstraction. That engine is a much larger project re-used across several
+games (RedCraft, Chess Soul, LuminaGI's GI subsystem, this demo); it lives in
+its own repository.
+
+The Vulkan-relevant engine files (paths shown relative to the engine repo):
+
+| File | Lines | What it does |
+| --- | --- | --- |
+| `Engine/Code/Engine/Renderer/VulkanRenderer.{h,cpp}` | ~3880 | Instance/device/swapchain/queues, bindless atlas (256-slot `sampler2D[]` with `descriptorBindingPartiallyBound`), 4 MB model UBO ring (dynamic offset), camera UBO ring, descriptor set layouts, pipeline cache, draw redirect for MT secondary recording, `VkMaterialPC` 16 B push constant carrying `{DiffuseId, NormalId, SpecularId, _pad}` for DX12 parity. |
+| `Engine/Code/Engine/Renderer/VulkanDeferredPath.{h,cpp}` | ~1100 | The deferred render pass + lighting subpass + forward A/B render pass + forward overlay render pass + per-thread secondary cmd buffer + pool double-buffering, GPU timestamp pool with per-slot mode tracking, `LAZILY_ALLOCATED` G-buffer alloc with `DEVICE_LOCAL` fallback + startup log, CPU-side recording-time `std::chrono` ring + 64-frame rolling avg. |
+| `Engine/Code/Engine/Renderer/VulkanMemoryPool.{h,cpp}` | smaller | Pool allocator for Vulkan device memory (per memory type, sub-allocation from large blocks). |
+
+What's in **this** repo:
+- `Code/Game/` — game-side code (App.cpp, Game.cpp, Player.cpp, Prop.cpp, Entity.cpp); F2/F3/F4 toggles; piece spawn + scene setup
+- `Run/Data/Shaders/Vulkan/` — GLSL sources (`gbuffer.vert/frag`, `gbuffer_pcutbn.vert/frag`, `lighting.frag`, `forward_lit.frag`, `forward_lit_pcutbn.frag`, `default.vert/frag`) and their `.spv` builds
+- `Run/Data/Models/LewisSet/` — chess piece GLBs + auto-extracted normal maps
+- `docs/` — talking points, perf baseline captures, deployment checklist
+- `Run/VulkanTest_Release_x64.exe` — runnable build
+
+If you want to see the actual Vulkan plumbing (subpass setup, bindless
+descriptor binding, MT secondary cmd recording, lazy-alloc fallback,
+timestamp double-buffering), it's in those engine files; happy to walk
+through them on a screen-share.
+
 ## What it does
 
 - One `VkRenderPass` with two subpasses: G-buffer fill → lighting via `subpassInput`.
@@ -231,13 +260,25 @@ via `std::async` and immediately continues recording its own debug-render
 geometry into `secondary[0]`. Only then does it `wait()` on the workers, so
 main and workers genuinely overlap.
 
-**Honest measurement note.** For this 16-piece scene with ~30 draws total, the
-recording cost is microseconds per frame even single-threaded — far below
-GPU-bound frame time, so multithreading doesn't move the FPS counter on
-desktop. The architectural value shows up in shipped engines that record
-hundreds of thousands of draws per frame, where main-thread cmd recording is
-genuinely a bottleneck. The demo proves the pattern; it doesn't prove the
-benefit at this scale.
+**Honest measurement note (measured 2026-05-05).** Tested MT off vs on at
+piece counts of 16, 256, and 1024 via the F4 stress mode. Across all three,
+the cpu-rec timer showed **no observable delta** between MT off and MT on.
+The architectural pattern is shipped and toggleable; the measured benefit
+on this hardware at this scale is zero.
+
+Diagnosis: the MT split parallelizes only the record phase — workers
+replaying `vkCmd*` from captured `PreparedDraw` structs. The prepare phase
+runs on main and scales linearly with piece count: every piece calls
+`SetModelConstants` (advances the model UBO ring) and `SetMaterialConstants`
+(writes the bindless slot trio). Both touch shared mutable engine state and
+can't be parallelized without an engine-side refactor (e.g., lock-free
+thread-local UBO pools per worker). Record-phase cost is small relative to
+prepare-phase at these draw counts, so even fully parallelizing record
+buys little.
+
+To make MT measurably help in this implementation, the prepare phase
+itself would need restructuring. Full per-piece-count breakdown plus
+diagnosis is in [`docs/perf_baseline.md`](docs/perf_baseline.md) Test D.
 
 ### Normal mapping
 
@@ -362,29 +403,40 @@ attribute the bandwidth difference cleanly to the render-path choice.
 
 ## Measuring on desktop with Nsight Graphics
 
-Even though frame time doesn't move on a desktop NVIDIA card, the L2 / DRAM
-counter difference between the two F2 modes is real and measurable in NVIDIA
-Nsight Graphics:
+Captures and the full counter table are in
+[`docs/perf_baseline.md`](docs/perf_baseline.md). Headline measured numbers
+on RTX 4080 Laptop (NVIDIA Vulkan driver, Nsight Graphics 2025.3):
+
+- **L2 Section Hit Rate, lighting subpass: 88.5 %** — confirms the
+  G-buffer fits in L2 on this hardware. The lighting subpass is the single
+  3-vertex `vkCmdDraw` after the `vkCmdNextSubpass`; that's the window
+  where `subpassLoad` reads the G-buffer attachments, and ~89 % of those
+  reads hit L2.
+- **VRAM Throughput, lighting subpass: 5.6 % of peak** — almost no VRAM
+  traffic during lighting. Consistent with the G-buffer being L2-resident.
+- **L2 Throughput, lighting subpass: 12.4 % of peak** — moderate L2 use
+  during the full-screen triangle, expected since the work is mostly
+  fragment shading, not memory.
+- **`LAZILY_ALLOCATED_BIT` memory type — not exposed by NVIDIA desktop
+  Vulkan driver**, so the fallback to `DEVICE_LOCAL_BIT` engages and the
+  G-buffer lands in standard device-local memory. This is the expected,
+  correct outcome on this hardware; the same code path picks a real lazy
+  heap on Adreno where the type does exist. Receipt: `[gbuffer]` startup
+  log in `Run/gbuffer_alloc.log` shows `lazy=NO` for all three attachments.
+- **Frame time delta between deferred and forward: not significant** —
+  on a desktop IMR, both paths fit comfortably in L2 and frame time stays
+  ~equal. The bandwidth differential the design targets is mobile-specific.
+
+Workflow if you want to reproduce or extend:
 
 1. Install [Nsight Graphics](https://developer.nvidia.com/nsight-graphics) (free).
-2. Run the demo, enter the 3D scene, leave the camera idle on the chess pieces.
-3. In Nsight: `File → Connect → Attach to Process` → `VulkanTest_Debug_x64.exe`
-   (or the Release variant). Activity: **GPU Trace**.
-4. Capture a frame in deferred mode.
-5. In the captured frame, look at the **Memory** panel:
-   - **DRAM Read Throughput** / **Write Throughput**
-   - **L2 Cache Hit Rate**
-   - **L2 Cache Throughput**
-6. Press F2 in the demo to toggle to forward, capture a second frame, compare.
-
-Expected pattern on a desktop IMR: deferred shows lower DRAM read bytes per
-frame (G-buffer reads serviced by L2 because they fit), forward shows higher
-L2 hit rate on the lit-pass writes but no special saving. Difference in
-absolute DRAM bandwidth is single-digit MB per frame on this hardware —
-~1-3% of the card's total memory bandwidth — which doesn't move the frame
-time, but is the same bandwidth differential that, scaled to Adreno's
-1-2 MB tile memory regime, becomes the headline 30-50% bandwidth win the
-mobile-renderer literature talks about.
+2. Run `Run/VulkanTest_Release_x64.exe`, enter the 3D scene, idle the camera.
+3. In Nsight: `Connect → Local`, point at the exe, Activity: **GPU Trace**.
+4. Press Generate to capture a frame; in the report timeline, select the
+   3-vertex draw inside subpass 1 (the lighting pass) — right panel
+   aggregates the counters over that selection.
+5. F2 toggles between deferred and forward; F3 toggles MT recording;
+   F4 cycles piece count for stress testing.
 
 In-app, the HUD already shows GPU timestamps for both modes
 (`gbuf X ms  lighting Y ms` for deferred, `forward total Z ms` for forward),
